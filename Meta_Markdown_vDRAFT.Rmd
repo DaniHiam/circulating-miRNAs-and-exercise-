@@ -1,0 +1,2287 @@
+---
+title: "Circulating miRNA in response to exercise: Meta_Analysis"
+author: "Danielle Hiam"
+date: "18/08/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set
+setwd ("C:/Users/dhiam/OneDrive - Deakin University/Manuscripts/circ-miRs in exercise systematic review")
+
+library(tidyverse)
+library(readxl)
+#library(dmetar) DOWNLOAD
+library(meta)
+library(metaforest)
+library(metafor)
+library(clubSandwich)
+library(caret)
+library(ggplot2)
+library(rmcorr)
+library(lme4)
+library(lmerTest)
+```
+
+``` {r, include=T}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V3.xlsx", sheet =2)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+
+dat=dat %>%
+  filter(Tissue != "ECV")
+```
+
+```{r echo = FALSE, eval = FALSE}
+# Calculate phi for vcalc
+corr=read_excel("META_TABLE_FOR R UPLOAD_V3.xlsx", sheet = 4)
+colnames(corr)
+corr$ID = factor(corr$ID)
+corr$Time = factor(corr$Time)
+
+corr_sub = corr %>%
+  filter(Study == "Nielsen")
+
+corr_sub$Time <- factor(corr_sub$Time,
+                        levels = c("PRE", "POST", "1HP", "3HP")) 
+
+mm= lmer(Mean ~ Time + (1|ID), corr_sub)
+summary(mm)
+# miRNA-1-3p approx correlation: Lovett (r= 0.48-0.7), Chalchat 0.48-0.7, Neilsen 0.5-0.69
+```
+
+
+#miR-1 Analysis
+``` {r, include=T, error= TRUE}
+#Create unique ID for random effect
+dat$cohort.in.study <- paste0(dat$StudyName, ".", dat$ExTreat)
+
+#Variance Matrix indicating multiple timepoints (Time_NUM) within studies (StudyNUM) and also cohorts within studies (ExTreat).
+#Variance-covariance (vcalc) is a matrix of dependent effect sizes (i.e multiple timepoints) or more specifying sampling error. Phi specifies autocorrelation of outcomes measured at different timepoints.(Estimated, why club sandwich is used to correct for any misspecification). 
+# To specify Phi, I ran some simple linear regression to estimate phi (correlation between timepoints) of original studies.
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat, 
+            mods = ~ factor(Time_NUM) + Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR") #continuous-time autoregressive structure when timepoints are NOT evenly spaced
+           # tdist = TRUE) #Only if there were less than 5 studies
+BASE
+
+# Cluster-robust inference methods
+# https://link-springer-com.ezproxy-b.deakin.edu.au/article/10.1007/s11121-021-01246
+# Robust variance estimation (RVE), which provides a way to include dependent effect sizes in meta-regression, even when the nature of the dependence structure is unknown
+#adjust for small studies and also any potential mis-spefication of the model (due to V-CoV matrix dependent estimations)
+#RVE involves use of a working model for dependence, which approximates the dependence structure but does not need to be entirely correct. Even when the working model is mis-specified, meta-regression coefficient estimates will be unbiased, and their standard errors (along with hypothesis tests and confidence intervals) will provide valid quantification of uncertainty. 
+res=robust(BASE, cluster=dat$cohort.in.study, adjust = T, clubSandwich = T, digits = 3)
+res=capture.output(res)
+
+DF=as.data.frame(res$beta, res$se)
+write(res, "miR-1 results.csv")
+
+#Club Sandwich package way for 'correcting' mispec, however metafor is easier (same method)
+coef_test(BASE, vcov=V,dat$cohort.in.study)
+par(mfrow=c(1,1))
+profile(res)
+# Both profile likelihood plots are peaked at the respective parameter estimates (as indicated by the vertical dotted lines) and the log likelihoods quickly decrease (i.e., become more negative) as the values of the components are moved away from the actual REML estimates. Hence, we can be fairly confident that both variance components are identifiable.
+#Plots should peak at the parameter estimates. If plot is flat, then this suggests that the model is overparameterized.
+#Again, profile likelihood plots should be used to ensure the identifiability of the variance (and correlation) components when fitting complex meta-analytic models. In the multivariate model, there is one variance component, denoted as τ2, and one correlation component, denoted as p
+#https://academic.oup.com/bioinformatics/article/25/15/1923/213246?login=false
+```
+### Do we need to account for between study variance? Yes big difference in AIC between BASE and without between-study variance
+```{r, include=T, error= TRUE}
+# Build a  model without between-study variance.
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "AR",
+            tdist = TRUE,
+            tau2=c(0))
+
+# Perform a likelihood-ratio-test to determine the significance of the variance.
+aov_between <- anova(BASE,modelnovar1) 
+
+# Join these results in a table
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+
+```
+## Calculating heterogeneity between and within study. 
+```{r, include=T, error= TRUE}
+# Determining how the total variance is distributed over the
+# three levels of the meta-analytic model;
+# Print the results in percentages on screen.
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASE$sigma2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASE$tau2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+```
+Level One: Sampling Variance
+Level Two: within study (outcomes eg-timepoints)
+Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+### GREAT BLOG: https://www.dsquintana.blog/how-do-you-decide-which-studies-in-a-meta-analysis-are-influential-and-should-be-removed/
+```{r, include=T, error= TRUE}
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            slab = paste(StudyName, Timepoints),
+            tdist = TRUE)
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+
+# Calculate CI for all observed effect sizes
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+# Create filter variable
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+# Count number of outliers:
+sum(dat2$outlier)
+
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+
+# Make a basic plot, based on the data in df, and specify that the x-variable is
+# the effect size, 'd', the colour and fill of the histogram bars are based on
+# the value of 'outlier':
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  # Add a histogram with transparent bars (alpha = .2)
+  geom_histogram(alpha = .2) +
+  # Add a vertical line at the pooled effect value (m_re$b[1])
+  geom_vline(xintercept = BASE$b[1]) +
+  # Apply a black and white theme
+  theme_bw()
+
+
+### SENSITIVITY ANALYSIS
+
+#STUDENTIZED DELETED RESIDUALS : Identifies potential outlier studies
+#The equation for the studentized deleted residual illustrates the three sources of variability that contribute to the difference between the observed effect size yi and the predicted average true effect when the ith study actually fits the assumed model, namely sampling variability, (residual) heterogeneity among the true effects, and imprecision in the predicted average effect.
+#If the studies actually follow the assumed model, then the studentized deleted residuals from the set of studies approximately follow a standard normal distribution. On the other hand, a study that does not fit the assumed model will tend to yield an observed effect that deviates more strongly  than would be expected based on these three sources of variability. Hence, its studentized deleted residual will tend to be large.
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 20, 20)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 20, 20))
+
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+
+HAT_VAL=hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM, type = "diagonal")
+HAT_VAL
+
+png(file='funnelplot-1.png') 
+funnel(BASE_No_MOD, main= "miRNA-1")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+# Egger’s test is a linear regression of the intervention effect estimates on their standard errors weighted by their inverse variance
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+
+```
+### Results with outlier (Cui 2016 and Yin 2020)
+``` {r, include=T, error= TRUE}
+#Examine without outlier
+dat3=dat2 %>%
+  filter(!(outlier == T))
+
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+                       struct = "CAR", 
+            #continuous-time autoregressive structure when time isnt evenly spaced
+            slab = paste(StudyName, Timepoints))
+           # tdist = TRUE) Only if less than 5 studies
+m_no_outliers
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+#write(RES1, "miR-133a results_Outliers removed.csv")
+
+funnel(m_no_outliers,main= "out")
+  ggtitle("miRNA-1" )
+par(mfrow=c(1,1))
+profile(m_no_outliers)
+
+# Determining how the total variance is distributed over the
+# three levels of the meta-analytic model;
+# Print the results in percentages on screen.
+n <- length(dat3$FC_SD)
+list.inverse.variances <- 1 / (dat3$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat3$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_2 <- (m_no_outliers$sigma2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_3 <- (m_no_outliers$tau2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+
+```
+
+# Adjusting for dependent cohorts within same study the last random-effect term has shown to be an overfit as it has returned 0 variability within a given Extreat in your data (you either don't have some many studies whose Extreat has repetition in it OR if you do, there is no much variation in them to demand an additional level). As such, you can remove ~1 | interaction(StudyNUM, ExTreat,Time_NUM) from your random-effect specification.
+### No diff between models, therefore ran the simpler model ( ~ TIME_NUM|Study.in.cohort).
+```{r, include=T, error= TRUE}
+V2 <- vcalc(FC_SD, cluster=StudyName, subgroup = ExTreat,
+             time1=Time_NUM, data = dat,  phi=0.6)
+BASE2= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list(~ Time_NUM | StudyName, 
+                          ~ 1 || interaction(StudyName, ExTreat)), 
+                          
+struct = c("UN","UN") )
+BASE2
+
+AIC(BASE,BASE2)
+BASE2
+res2=robust(BASE2, cluster=dat$cohort.in.study, adjust = T, clubSandwich = T, digits = 3)
+res2
+profile(BASE2)
+
+```
+
+# Exercise modality analysis 
+```{r}
+dat2= dat %>%
+  drop_na("FC_SD")
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+
+dat3_sub = dat2 %>%
+  filter(Exercise == "Resistance")
+
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2_sub,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2_sub, 
+            mods = ~ factor(Time_NUM),
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR") 
+BASE
+res=robust(BASE, cluster=dat2_sub$cohort.in.study, adjust = T, clubSandwich = T, digits = 3)
+res
+profile(BASE)
+```
+
+
+
+
+# miR-133a Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 4)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  drop_na("FC_SD")
+
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+    
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-133a results.csv")
+par(mfrow=c(1,2))
+profile(results)
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASE$sigma2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASE$tau2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+HAT_VAL=hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM, type = "diagonal")
+HAT_VAL
+
+png(file='funnelplot133a.png') 
+funnel(BASE_No_MOD, main= "miRNA-133a")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+
+# Sensitivity Analysis 
+## Results without outlier (Cui 2016, Yin 2020)
+
+dat3=dat2 %>%
+  filter(!(StudyName == "Cui_B"))
+
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR", 
+            slab = paste(StudyName, Timepoints))
+           
+m_no_outliers
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+##write(RES1, "miR-133a results_Outliers removed.csv")
+
+funnel(m_no_outliers)
+par(mfrow=c(1,1))
+profile(m_no_outliers)
+
+# Determining how the total variance is distributed over the
+n <- length(dat3$FC_SD)
+list.inverse.variances <- 1 / (dat3$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat3$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_2 <- (m_no_outliers$sigma2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_3 <- (m_no_outliers$tau2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+
+```
+```{r, include=F, error= TRUE}
+
+rho = 0.6 #Based on rough estimates from primary studies
+V <- with(dat3, 
+          impute_covariance_matrix(vi = FC_SD,
+                                   cluster = cohort.in.study,
+                                   r = rho))
+
+model= rma.mv(yi= FC_MEAN,
+              V = V, 
+              data = dat3, 
+              mods = ~ factor(Time_NUM)+Exercise,
+              random = list (~ Time_NUM|cohort.in.study),
+              struct = "AR")
+
+conf_int(model, 
+         vcov = "CR2")
+coef_test(model, 
+          vcov = "CR2")
+
+profile(model)
+```
+
+# miR-133b Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 5)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  drop_na("FC_SD")
+
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-133b results.csv")
+par(mfrow=c(1,2))
+profile(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASE$sigma2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASE$tau2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot133b.png') 
+funnel(BASE_No_MOD, main ="miRNA-133b")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+### Sensitivity Analysis
+``` {r, include=T, error= TRUE}
+## Results without outlier and influential (Cui 2016)
+# D'Souza 2018 and Yin 202 outlier only
+
+dat3=dat2 %>%
+  filter(!(StudyName == "Cui_B"))
+
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR", 
+            slab = paste(StudyName, Timepoints))
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+#write(RES1, "miR-133 results_Outliers removed.csv")
+
+funnel(m_no_outliers)
+par(mfrow=c(1,1))
+profile(m_no_outliers)
+
+# Determining how the total variance is distributed over the
+n <- length(dat3$FC_SD)
+list.inverse.variances <- 1 / (dat3$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat3$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_2 <- (m_no_outliers$sigma2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_3 <- (m_no_outliers$tau2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+
+```
+
+# miR-21 Analysis
+### Not enough studies/data to estimate model well, as profile likelihood plots are flat
+``` {r, include=T, error =TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 2)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  filter(Timepoints != list("0.5HP"))%>%
+ # filter(Timepoints != list("24HP"))%>%
+  drop_na("FC_SD")
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASEcar= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+par(mfrow=c(1,1))
+profile(BASEcar)
+#Results indicate model is over-parameterised and that the between study variance is non-existent. 
+#Therefore simplify model
+# https://constantinyvesplessen.com/post/es_id/
+BASEsimple= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise)
+
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASEsimple, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-21 results.csv")
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM) + Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            sigma2 = c(0))
+aov_between <- anova(BASEcar,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+
+#Results indicate model is over-parameterised and that the between study variance is non-existent. 
+#Therefore simplify model
+# https://constantinyvesplessen.com/post/es_id/
+
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASEsimple$sigma2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASEsimple$tau2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+#EITHER nothing is happening OR not enough data to make conclusion.
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2,
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot21.png') 
+funnel(BASE_No_MOD, main = "miRNA-21")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+## Sensitivity Analysis
+``` {r, include=T, error= TRUE}
+## Results without outlier (Cui 2016, Yin 2020)
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+colnames(dat2)
+dat3=dat2 %>%
+  filter(!(outlier == T))
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+#Variance Matrix 
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+ Exercise,
+            slab = paste(StudyName, Timepoints))
+           
+m_no_outliers
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+#write(RES1, "miR-21 results_Outliers removed.csv")
+
+funnel(m_no_outliers)
+par(mfrow=c(1,1))
+
+```
+
+# miR-126 Analysis
+### Not enough studies, likelihood profiles are flat ran no random effect
+``` {r, include=T, error=TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 3)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  drop_na("FC_SD")
+dat2 %>%
+  group_by(StudyName) %>%
+  count(StudyNUM)
+
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.8)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tdist = T)
+BASE
+
+#Results indicate model is over-parameterised and that the between study variance is non-existent. 
+#Therefore simplify model
+# https://constantinyvesplessen.com/post/es_id/
+BASEsimple= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+ Exercise,
+            tdist= T)
+BASEsimple
+
+anova(BASEsimple, BASE)
+
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASEsimple, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3,
+               verbose = T)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-126 results.csv")
+par(mfrow=c(1,1))
+plot(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+ Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASEsimple$sigma2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASEsimple$tau2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot126.png') 
+funnel(BASE_No_MOD, main="miRNA-126")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+###No outliers and therefore no sensitivity analysis required
+
+# miR-146 Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 6)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  #filter(Timepoints != "24HP")%>%
+  drop_na("FC_SD")
+dat2 %>%
+  group_by(StudyNUM) %>%
+  count(StudyNUM)
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+           
+
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3,
+               verbose = T)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-146a results.csv")
+par(mfrow=c(1,1))
+profile(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASE$sigma2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASE$tau2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+HAT_VAL=hatvalues(BASE_No_MOD, cluster= dat2$cohort.in.study, type = "diagonal")
+HAT_VAL
+
+png(file='funnelplot146a.png') 
+funnel(BASE_No_MOD, main= "miRNA-146a")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+
+# Sensitivity Analysis 
+# Outlier and influential
+# Outlier Only:
+
+dat3=dat2 %>%
+  filter(!(StudyNUM == "5")) #%>%
+#  filter(!(StudyNUM == "3"))
+
+
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR", 
+            slab = paste(StudyName, Timepoints))
+           
+m_no_outliers
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+#write(RES1, "miR-133a results_Outliers removed.csv")
+
+funnel(m_no_outliers)
+par(mfrow=c(1,1))
+profile(m_no_outliers)
+
+# Determining how the total variance is distributed over the
+n <- length(dat3$FC_SD)
+list.inverse.variances <- 1 / (dat3$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat3$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_2 <- (m_no_outliers$sigma2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_3 <- (m_no_outliers$tau2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+```
+
+# miR-206 Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 7)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  drop_na("FC_SD")
+  
+dat2 %>%
+  group_by(Time_NUM) %>%
+  count(Time_NUM)
+
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-206 results.csv")
+par(mfrow=c(1,2))
+profile(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASE$sigma2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASE$tau2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot206.png') 
+funnel(BASE_No_MOD, main="miRNA-206")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+## Sensitivity Analysis
+``` {r, include=T, error= TRUE}
+dat3=dat2 %>%
+  filter(!(StudyName == "Gomes"))
+
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR", 
+            slab = paste(StudyName, Timepoints))
+           
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+#write(RES1, "miR-206 results_Outliers removed.csv")
+
+funnel(m_no_outliers)
+par(mfrow=c(1,1))
+profile(m_no_outliers)
+
+# Determining how the total variance is distributed over the
+n <- length(dat3$FC_SD)
+list.inverse.variances <- 1 / (dat3$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat3$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_2 <- (m_no_outliers$sigma2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_3 <- (m_no_outliers$tau2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+
+```
+
+# miR-208 Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 8)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+ #filter(Timepoints!= "24HP") %>%
+  drop_na("FC_SD")
+  
+dat2 %>%
+  group_by(StudyNUM) %>%
+  count(StudyNUM)
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)-1+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-206 results.csv")
+par(mfrow=c(1,2))
+profile(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASE$sigma2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASE$tau2[1]) / (BASE$sigma2[1]
++ BASE$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot206.png') 
+funnel(BASE_No_MOD, main="miRNA-206")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+## Sensitivity Analysis
+``` {r, include=T, error= TRUE}
+## Results without outlier (Cui 2016, Yin 2020)
+
+dat3=dat2 %>%
+  filter(!(outlier == T))
+
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR", 
+            slab = paste(StudyName, Timepoints))
+           
+m_no_outliers
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+#write(RES1, "miR-206 results_Outliers removed.csv")
+
+funnel(m_no_outliers)
+par(mfrow=c(1,1))
+profile(m_no_outliers)
+
+# Determining how the total variance is distributed over the
+n <- length(dat3$FC_SD)
+list.inverse.variances <- 1 / (dat3$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat3$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_2 <- (m_no_outliers$sigma2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_3 <- (m_no_outliers$tau2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+
+```
+
+# miR-210 Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 9)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  drop_na("FC_SD")
+dat2 %>%
+  group_by(StudyNUM) %>%
+  count(StudyNUM)
+
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM) +Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+BASE
+          
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-210 results.csv")
+par(mfrow=c(1,2))
+profile(results)
+
+BASEsimple= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM),
+            tdist= T)
+BASEsimple
+anova(BASE,BASEsimple)
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASEsimple, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3,
+               verbose = T)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-210 results.csv")
+par(mfrow=c(1,1))
+plot(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASEsimple$sigma2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASEsimple$tau2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot210.png') 
+funnel(BASE_No_MOD, main="miRNA-210")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+
+# miR-221 Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 10)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+  filter(Tissue != "ECV")%>%
+  drop_na("FC_SD") 
+#  filter(Timepoints != "24HP")
+dat2 %>%
+  group_by(StudyNUM) %>%
+  count(StudyNUM)
+
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-221 results.csv")
+par(mfrow=c(1,2))
+profile(results)
+
+BASEsimple= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            tdist= T)
+BASEsimple
+anova(BASE,BASEsimple)
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASEsimple, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3,
+               verbose = T)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-221 results.csv")
+par(mfrow=c(1,1))
+plot(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASEsimple$sigma2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASEsimple$tau2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot221.png') 
+funnel(BASE_No_MOD, main="miRNA-221")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+
+# miR-222 Analysis
+``` {r, include=T, error= TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 11)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+    drop_na("FC_SD")
+dat2 %>%
+  group_by(StudyNUM) %>%
+  count(StudyNUM)
+#Sample size
+dat3=dat2 %>%
+  group_by(StudyName) %>%
+ count(N)
+
+sum(dat3$N)
+
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+BASE
+          
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-222 results.csv")
+par(mfrow=c(1,2))
+profile(results)
+
+BASEsimple= rma.mv(yi = FC_MEAN,  
+            V= FC_SD, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            tdist= T)
+BASEsimple
+anova(BASE,BASEsimple)
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASEsimple, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3,
+               verbose = T)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-221 results.csv")
+par(mfrow=c(1,1))
+plot(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASEsimple$sigma2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASEsimple$tau2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot222.png') 
+funnel(BASE_No_MOD, main="miRNA-222")
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
+## Sensitivity Analysis
+``` {r, include=T, error=TRUE}
+## Results without outlier (Cui 2016, Yin 2020)
+dat3=dat2 %>%
+  filter(!(outlier == T))
+
+dat3= dat3 %>%
+  drop_na("FC_SD")
+
+V2 <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat3,  phi=0.6)
+
+m_no_outliers= rma.mv(yi = FC_MEAN,  
+            V = V2, 
+            data = dat3, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            
+            slab = paste(StudyName, Timepoints))
+           
+m_no_outliers
+
+results2=robust(m_no_outliers, cluster=dat3$cohort.in.study, 
+                adjust = T, clubSandwich = T, digits = 3)
+results2
+RES1=capture.output(results)
+#write(RES1, "miR-222 results_Outliers removed.csv")
+
+funnel(m_no_outliers)
+par(mfrow=c(1,1))
+profile(m_no_outliers)
+results
+# Determining how the total variance is distributed over the
+n <- length(dat3$FC_SD)
+list.inverse.variances <- 1 / (dat3$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat3$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_2 <- (m_no_outliers$sigma2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+I2_3 <- (m_no_outliers$tau2[1]) / (m_no_outliers$sigma2[1]
++ m_no_outliers$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1
+amountvariancelevel2
+amountvariancelevel3
+
+```
+
+# miR-378b Analysis
+``` {r, include=T, error=TRUE}
+dat=read_excel("META_TABLE_FOR R UPLOAD_V2.xlsx", sheet = 12)
+dat$ExTreat = factor(dat$ExTreat)
+dat$StudyNUM = factor(dat$StudyNUM)
+dat2=dat %>%
+    drop_na("FC_SD")
+
+#Create unique ID for random effect
+dat2$cohort.in.study <- paste0(dat2$StudyNUM, ".", dat2$ExTreat)
+#Variance Matrix 
+V <- vcalc(FC_SD, cluster=cohort.in.study,
+             time1=Time_NUM, data = dat2,  phi=0.6)
+
+BASE= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR")
+BASE
+          
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASE, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-378 results.csv")
+par(mfrow=c(1,2))
+profile(results)
+
+BASEsimple= rma.mv(yi = FC_MEAN,  
+            V= FC_SD, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            tdist= T)
+BASEsimple
+anova(BASE,BASEun)
+
+# ROBUST VARIANCE ESTIMATION
+results=robust(BASEsimple, cluster=dat2$cohort.in.study, 
+               adjust = T, 
+               clubSandwich = T, 
+               digits = 3,
+               verbose = T)
+results
+RES1=capture.output(results)
+#write(RES1, "miR-221 results.csv")
+par(mfrow=c(1,1))
+plot(results)
+
+# Do we need to account for between study variance?
+modelnovar1 <- rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            mods = ~ factor(Time_NUM)+Exercise,
+            random = list (~ Time_NUM|cohort.in.study),
+            struct = "CAR",
+            tau2  =c(0))
+aov_between <- anova(BASE,modelnovar1) 
+aov_table <- rbind(
+c(df=aov_between$p.f, aov_between$fit.stats.f[c(3:4, 1)], LRT = NA, p = NA),
+c(df=aov_between$p.r, aov_between$fit.stats.r[c(3:4, 1)], LRT = aov_between$LRT, p = aov_between$pval))
+rownames(aov_table) <- c("Multivariate model", "Between-studies variance constrained")
+aov_table
+# Calculating heterogeneity between and within study. 
+n <- length(dat2$FC_SD)
+list.inverse.variances <- 1 / (dat2$FC_SD)
+sum.inverse.variances <- sum(list.inverse.variances)
+squared.sum.inverse.variances <- (sum.inverse.variances) ^ 2
+list.inverse.variances.square <- 1 / (dat2$FC_SD^2)
+sum.inverse.variances.square <-
+sum(list.inverse.variances.square)
+numerator <- (n - 1) * sum.inverse.variances
+denominator <- squared.sum.inverse.variances -
+sum.inverse.variances.square
+estimated.sampling.variance <- numerator / denominator
+I2_1 <- (estimated.sampling.variance) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_2 <- (BASEsimple$sigma2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+I2_3 <- (BASEsimple$tau2[1]) / (BASEsimple$sigma2[1]
++ BASEsimple$tau2[1] + estimated.sampling.variance)
+amountvariancelevel1 <- I2_1 * 100
+amountvariancelevel2 <- I2_2 * 100
+amountvariancelevel3 <- I2_3 * 100
+amountvariancelevel1 #Level One: Sampling Variance
+amountvariancelevel2 #Level Two: within study (outcomes eg-timepoints)
+amountvariancelevel3 #Level Three:  between study (studies)
+
+# IDENTIFYING INFLUENTIAL STUDIES
+#Run without MODERATOR FOR THIS PART OF ANALYSIS
+BASE_No_MOD= rma.mv(yi = FC_MEAN,  
+            V = V, 
+            data = dat2, 
+            slab = paste(StudyName, Timepoints))            
+
+#Searching for outliers
+BASE_No_MOD$ci.lb
+BASE_No_MOD$ci.ub
+dat2$upperci <- dat2$FC_MEAN + 1.96 * sqrt(dat2$FC_SD)
+dat2$lowerci <- dat2$FC_MEAN - 1.96 * sqrt(dat2$FC_SD)
+dat2$outlier <- dat2$upperci < BASE_No_MOD$ci.lb | dat2$lowerci > BASE_No_MOD$ci.ub
+sum(dat2$outlier)
+dat2[dat2$outlier, c("FC_MEAN", "upperci", "lowerci")]
+ggplot(data = dat2, aes(x = FC_MEAN, colour = outlier, fill = outlier)) +
+  geom_histogram(alpha = .2) +
+  geom_vline(xintercept = BASE_No_MOD$b[1]) +
+  theme_bw()
+
+### SENSITIVITY ANALYSIS
+rstandard(BASE_No_MOD,cluster= dat2$cohort.in.study)
+par(mfrow=c(1,1))
+cooks_cohort=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+plot(cooks_cohort, type="o", pch=19, xlab="Cohort in Study", ylab="Cook's Distance", xaxp = c(0, 50, 50)) 
+cooks_study=cooks.distance.rma.mv(BASE_No_MOD, cluster= dat2$StudyNUM)
+plot(cooks_study, type="o", pch=19, xlab="Study", ylab="Cook's Distance",xaxp = c(0, 50, 50))
+dfbetas.rma.mv(BASE_No_MOD, cluster= dat2$cohort.in.study)
+hatvalues(BASE_No_MOD, cluster= dat2$StudyNUM)
+
+png(file='funnelplot222.png') 
+funnel(BASE_No_MOD)
+dev.off()
+
+#Running on a basic model
+BASE_UNI= rma(yi = FC_MEAN,  
+            vi = FC_SD, 
+            data = dat2)
+
+inf=influence(BASE_UNI)
+plot(inf, layout=c(4,2))
+
+#Egger's regression random effects (mixed not available)
+regtest(BASE_UNI)
+#Begg's test
+regtest(dat2$FC_MEAN, dat2$FC_SD)
+```
