@@ -1,0 +1,557 @@
+---
+title: "Meta-analysis"
+author: "Danielle Hiam"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+    code_folding: "hide"
+  html_notebook:
+    theme: lumen
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r libraries}
+library(metafor)
+library(Matrix)  
+library(clubSandwich)
+library(tidyverse)
+library(stringr)
+library(tibble)
+library(kableExtra)
+library(forestplot)
+library(VIM)
+```
+
+# Setwd and import data
+```{r setup}
+setwd("SET PATH")
+miR_data <- readRDS("rds/miR_data_clean_imputed.rds")
+```
+
+# Data Prep and covariance matrix
+```{r Data Prep}
+miRs <- unique(miR_data$miRNA)
+results_list <- list()
+model_selection_table <- data.frame()
+best_models <- list()
+best_model_types <- list()
+heterogeneity_table <- data.frame() 
+sink("csv/Meta_summary_log.txt")
+
+# Decaying correlation covariance matrix
+build_cov_matrix <- function(vi, time, rho_base = 0.6, decay_rate = 0.2) {
+  n <- length(vi)
+  mat <- matrix(0, n, n)
+  for (i in 1:n) {
+    for (j in 1:n) {
+      if (i == j) {
+        mat[i, j] <- vi[i]
+      } else {
+        rho_ij <- rho_base * exp(-decay_rate * abs(time[i] - time[j]))
+        mat[i, j] <- sqrt(vi[i]) * sqrt(vi[j]) * rho_ij
+      }
+    }
+  }
+  return(mat)
+}
+
+for (miR in miRs) {
+    tryCatch({
+    withCallingHandlers({
+        miR_df <- miR_data %>%
+      filter(miRNA == miR & !is.na(logFC_SD)) %>%
+      mutate(
+        cohort_id = paste(Study_ID, Group, sep = "-"),
+        Timepoints = factor(Timepoints, levels = c("PRE", "0HP", "1HP", "1.5HP","2HP", "4HP", "5HP", "21HP", "24HP", "48HP", "3HP", "12HP", "6HP")),
+        vi = (logFC_SD^2) / Total_N,
+        SEM = sqrt(vi),
+        CI_lower = logFC - 1.96 * SEM,
+        CI_upper = logFC + 1.96 * SEM
+      )
+    
+    # Recode into Timewindows
+    data_clean <- miR_df %>%
+      mutate(TimeWindow = case_when(
+        Timepoints == "PRE" ~ "Baseline",
+        Timepoints == "0HP" ~ "Post",
+        Timepoints %in% c("1HP", "1.5HP", "2HP") ~ "1-2HP",
+        Timepoints %in% c("3HP", "4HP", "5HP", "6HP") ~ "3-6HP",
+        Timepoints == "12HP" ~ "12HP",
+        Timepoints %in% c("21HP", "24HP") ~ "24HP",
+        Timepoints == "48HP" ~ "48HP",
+        TRUE ~ NA_character_
+      )) %>%
+      mutate(TimeWindow = factor(TimeWindow, levels = c("Baseline", "Post", "1-2HP", "3-6HP", "12HP", "24HP", "48HP")))
+    
+    # Remove studies with <5 studies per timewindow
+    window_counts <- data_clean %>%
+      group_by(TimeWindow) %>%
+      summarise(n_study = n_distinct(Study_ID), .groups = "drop") %>%
+      filter(n_study >= 5)
+        if (nrow(window_counts) == 0) {
+        next
+    }
+    
+    valid_windows <- window_counts$TimeWindow
+    data_clean2 <- data_clean %>%
+      filter(TimeWindow %in% valid_windows)
+    
+    # Also need to map time to numerci for creating the decay corr matrix
+    time_map <- c("Baseline" = 0, "Post" = 0.1, "1-2HP" = 1.5, "3-6HP" = 4.5, "12HP" = 12, "24HP" = 24, "48HP" = 48)
+    data_clean2$Timepoint_numeric <- time_map[as.character(data_clean2$TimeWindow)]
+
+    # Covariance matrix (V_matrix) with decay parameters
+    cohort_list <- split(data_clean2, data_clean2$cohort_id)
+    V_list <- lapply(cohort_list, function(df) {
+      build_cov_matrix(df$vi, df$Timepoint_numeric, rho_base = 0.6, decay_rate = 0.2)
+    })
+    V_matrix_final <- bdiag(V_list) %>% as.matrix()
+    
+    # Count studies per Exercise_Modality
+    mod_counts <- data_clean2 %>%
+      group_by(Exercise_Modality) %>%
+      summarise(n_study = n_distinct(Study_ID), .groups = "drop")
+    include_mod <- all(mod_counts$n_study >= 3)
+    
+   if (include_mod && nrow(mod_counts) > 1) { 
+    cat("Including Exercise_Modality as moderator\n")
+    mods_formula <- as.formula("~ factor(TimeWindow) + factor(Exercise_Modality)")
+  } else {
+    cat("Skipping Exercise_Modality moderator due to insufficient studies\n")
+    mods_formula <- as.formula("~ factor(TimeWindow)")
+  }
+    
+    # Fit all 4 models with chosen moderators
+    m1 <- rma.mv(yi = logFC, V = V_matrix_final, mods = mods_formula,
+                 random = ~ 1 | Study_ID, data = data_clean2, method = "REML")
+    m2 <- rma.mv(yi = logFC, V = V_matrix_final, mods = mods_formula,
+                 random = ~ 1 | Study_ID/cohort_id, data = data_clean2, method = "REML")
+    m3 <- rma.mv(yi = logFC, V = V_matrix_final, mods = mods_formula,
+                 random = ~ Timepoint_numeric | Study_ID, data = data_clean2, method = "REML")
+    m4 <- rma.mv(yi = logFC, V = V_matrix_final, mods = mods_formula,
+                 random = list(~ 1 | Study_ID/cohort_id, ~ Timepoint_numeric | Study_ID),
+                 data = data_clean2, method = "REML")
+    
+    models <- list(`RI` = m1, `Nested` = m2, `Slope` = m3, `Nested+Slope` = m4)
+    AICs <- sapply(models, AIC)
+    best_type <- names(which.min(AICs))
+    best_model <- models[[best_type]]
+    best_models[[miR]] <- best_model
+    best_model_types[[miR]] <- best_type
+    
+    # Model warnings for bad fits
+      if (!is.null(best_model$optim$convergence) && best_model$optim$convergence != 0) {
+         warn_log <<- c(warn_log, paste("Optimization convergence code:", best_model$optim$convergence))
+      }
+      if (any(best_model$tau2 == 0)) {
+      }
+      if (!is.null(warn_log)) {
+        cat("Warnings for", miR, ":", paste(warn_log, collapse = "; "), "\n")
+      }
+      
+
+# Heterogeneity stats
+tau2_components <- best_model$tau2
+total_tau2 <- sum(tau2_components)
+avg_vi <- mean(data_clean2$vi, na.rm=TRUE)
+I2 <- 100 * total_tau2 / (total_tau2 + avg_vi)
+
+QE <- best_model$QE
+df_QE <- best_model$k - best_model$p
+pval_QE <- best_model$QEp
+
+QM <- best_model$QM
+df_QM <- best_model$m - 1
+pval_QM <- best_model$QMp
+I2_levels <- 100 * tau2_components / (sum(tau2_components) + avg_vi)
+
+heterogeneity_table <- rbind(heterogeneity_table, data.frame(
+  miRNA = miR,
+  Best_Model = best_type,
+  Total_tau2 = total_tau2,
+  I2 = I2,
+  QE = QE,
+  QE_df = df_QE,
+  QE_pval = pval_QE,
+  QM = QM,
+  QM_df = df_QM,
+  QM_pval = pval_QM
+))
+
+# ClubSandwich robust SE
+    coefs_robust <- coef_test(best_model, cluster = data_clean2$Study_ID, vcov = "CR2")
+    coefs <- coefs_robust %>%
+      as.data.frame() %>%
+      mutate(
+        miRNA = miR,
+        model = best_type,
+        Term = rownames(coefs_robust),
+        `CI Lower` = beta - qt(0.975, df_Satt) * SE,
+        `CI Upper` = beta + qt(0.975, df_Satt) * SE
+      ) %>%
+      select(miRNA, model, Term, Estimate = beta, SE, tstat, df = df_Satt, `P value` = p_Satt, `CI Lower`, `CI Upper`)%>%
+  mutate(
+    Tau = total_tau2,
+    crit_value = ifelse(is.na(df) | df <= 0, qnorm(0.975), qt(0.975, df)),
+    PI_Lower = Estimate - crit_value * sqrt(SE^2 + total_tau2^2),
+    PI_Upper = Estimate + crit_value * sqrt(SE^2 + total_tau2^2)
+  )
+    
+    results_list[[miR]] <- coefs
+    model_selection_table <- rbind(model_selection_table, data.frame(miRNA = miR, Best_Model = best_type, AIC = AICs[best_type]))
+    })
+})
+}
+sink()
+
+full_results <- bind_rows(results_list)
+write.csv(full_results, "csv/All_miRNA_meta_results.csv", row.names = FALSE)
+write.csv(model_selection_table, "csv/Model_Selection_Summary.csv", row.names=FALSE)
+write.csv(heterogeneity_table, "csv/heterogeneity_results.csv")
+```
+
+# Diagnostics
+# **Heterogeneity and Sensitivity Analysis**
+
+## **Publication Bias**
+ - Generate funnel plot to assess publication bias
+ - Egger's test to test for asymmetry (Random effects model not available)
+```{r}
+miR_data <- miR_data %>%
+  mutate(vi = ifelse(!is.na(logFC_SD) & !is.na(Total_N), (logFC_SD^2)/Total_N, NA_real_))
+miRs <- unique(miR_data$miRNA)
+funnel_plots <- list()
+influence_results <- list()
+egger_results <- list()
+
+for (miR in miRs) {
+  tryCatch({
+    miR_data_subset <- miR_data %>%
+      filter(miRNA == miR & !is.na(logFC) & !is.na(vi))
+    if (nrow(miR_data_subset) < 5) {
+      next
+    }
+
+base_uni <- rma(yi = logFC, vi = vi, data = miR_data_subset, method = "REML")
+png(filename = paste0("figures/diagnostics/funnel_", miR, ".png"))
+funnel(x = base_uni)
+dev.off()
+
+# Egger's test
+    egger <- regtest(base_uni, model = "rma", predictor = "sei")
+    influence_results[[miR]] <- inf
+    egger_results[[miR]] <- egger
+  })
+}
+
+extract_egger_summary <- function(egger_obj, miR_name) {
+  data.frame(
+    miRNA = miR_name,
+    z_value = egger_obj$zval,
+    p_value = egger_obj$pval,
+    ci_lower = egger_obj$ci.lb,
+    ci_upper = egger_obj$ci.ub
+  )
+}
+egger_df <- map2_dfr(
+  .x = egger_results,
+  .y = names(egger_results),
+  .f = extract_egger_summary
+)
+```
+
+
+# Loo Results
+```{r}
+min_studies <-4
+all_results <- list()   
+
+for (miR in names(best_models)) {
+  model_obj <- best_models[[miR]]
+  data_clean <- model_obj$data
+  V_matrix <- model_obj$V
+  if (is.null(data_clean) || is.null(V_matrix)) {
+    next
+  }
+  if (length(unique(data_clean$Study_ID)) < min_studies) {
+    next
+  }
+    if (is.null(rownames(data_clean))) {
+    rownames(data_clean) <- paste0(data_clean$Study_ID, "_", seq_len(nrow(data_clean)))
+  }
+  if (is.null(rownames(V_matrix))) {
+    rownames(V_matrix) <- rownames(data_clean)
+  }
+  
+  random_structure <- switch(
+    best_model_types[[miR]],
+    "Intercept" = ~ 1 | Study_ID,
+    "Nested" = ~ 1 | Study_ID/cohort_id,
+    "Slope" = ~ Timepoint_numeric | Study_ID,
+    "Nested+Slope" = list(~1 | Study_ID/cohort_id, ~Timepoint_numeric | Study_ID)
+  )
+  
+  mods_formula <- ~ factor(TimeWindow)
+  
+  full_model <- rma.mv(
+    yi = data_clean$logFC,
+    V = V_matrix,
+    mods = mods_formula,
+    random = random_structure,
+    data = data_clean,
+    method = "REML"
+  )
+  
+  full_coefs <- clubSandwich::coef_test(full_model, cluster = data_clean$Study_ID, vcov = "CR2") %>%
+    as_tibble(rownames = "Term")
+  
+  full_intercept <- coef(full_model)[1]
+  full_intercept_p <- full_coefs %>% filter(Term == "(Intercept)") %>% pull(p_Satt)
+  if (length(full_intercept_p) == 0) full_intercept_p <- full_coefs$p_Satt[1]
+  full_intercept_signif <- full_intercept_p < 0.05
+  
+  full_signif <- full_coefs %>%
+    mutate(significant = p_Satt < 0.05) %>%
+    select(Term, significant) %>%
+    deframe()
+  
+  full_tau2 <- sum(full_model$tau2)
+  full_avg_vi <- mean(data_clean$vi, na.rm = TRUE)
+  full_I2 <- 100 * full_tau2 / (full_tau2 + full_avg_vi)
+  
+  study_ids <- unique(data_clean$Study_ID)
+  loo_results <- data.frame(
+    Study_ID = study_ids,
+    Estimate_Intercept = NA,
+    SE_Intercept = NA,
+    CI_lb_Intercept = NA,
+    CI_ub_Intercept = NA,
+    I2 = NA,
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in seq_along(study_ids)) {
+    data_loo <- filter(data_clean, Study_ID != study_ids[i])
+    exclude_rows <- which(data_clean$Study_ID == study_ids[i])
+    V_loo <- V_matrix[-exclude_rows, -exclude_rows]
+    
+    model_loo <- rma.mv(
+      yi = data_loo$logFC,
+      V = V_loo,
+      mods = mods_formula,
+      random = random_structure,
+      data = data_loo,
+      method = "REML"
+    )
+    
+    robust_loo <- clubSandwich::coef_test(model_loo, cluster = data_loo$Study_ID, vcov = "CR2")
+    intercept_row <- which(grepl("intrcpt|intercept", tolower(rownames(robust_loo))))
+    
+    if (length(intercept_row) == 1) {
+      beta <- robust_loo$beta[intercept_row]
+      se <- robust_loo$SE[intercept_row]
+      df <- robust_loo$df_Satt[intercept_row]
+      t_crit <- qt(0.975, df)
+      ci_lb <- beta - t_crit * se
+      ci_ub <- beta + t_crit * se
+      
+      loo_results$Estimate_Intercept[i] <- beta
+      loo_results$SE_Intercept[i] <- se
+      loo_results$CI_lb_Intercept[i] <- ci_lb
+      loo_results$CI_ub_Intercept[i] <- ci_ub
+    } else {
+     }
+    
+    tau2 <- sum(model_loo$tau2)
+    avg_vi <- mean(data_loo$vi, na.rm = TRUE)
+    loo_results$I2[i] <- 100 * tau2 / (tau2 + avg_vi)
+  }
+
+  loo_results <- loo_results %>%
+    mutate(
+      Influence_Intercept = abs(Estimate_Intercept - full_intercept),
+      Influence_I2 = abs(I2 - full_I2),
+      influence_score = Influence_Intercept + (Influence_I2 / 100),
+      Flag_Sensitivity = case_when(
+        influence_score > 0.10 ~ "Yes (High influence)",
+        influence_score > 0.05 ~ "Possibly (Moderate influence)",
+        TRUE ~ "No"
+      )
+    )
+  
+flagged_studies <- loo_results %>%
+    filter(Flag_Sensitivity != "No") %>%
+    pull(Study_ID)
+  
+  sensitivity_models <- list()
+  
+  for (study in flagged_studies) {
+    data_excl <- filter(data_clean, Study_ID != study)
+    exclude_rows <- which(data_clean$Study_ID == study)
+    V_excl <- V_matrix[-exclude_rows, -exclude_rows]
+    
+    mod_excl <- rma.mv(
+      yi = data_excl$logFC,
+      V = V_excl,
+      mods = mods_formula,
+      random = random_structure,
+      data = data_excl,
+      method = "REML"
+    )
+    
+    tau2_excl <- sum(mod_excl$tau2)
+    avg_vi_excl <- mean(data_excl$vi, na.rm = TRUE)
+    I2_excl <- 100 * tau2_excl / (tau2_excl + avg_vi_excl)
+    coef_excl <- clubSandwich::coef_test(mod_excl, cluster = data_excl$Study_ID, vcov = "CR2") %>%
+      as_tibble(rownames = "Term")
+    
+    intercept_p_excl <- if ("(Intercept)" %in% coef_excl$Term) {
+      coef_excl %>% filter(Term == "(Intercept)") %>% pull(p_Satt)
+    } else if (nrow(coef_excl) >= 1) {
+      coef_excl$p_Satt[1]
+    } else {
+      NA
+    }
+    intercept_signif_excl <- if (!is.na(intercept_p_excl)) intercept_p_excl < 0.05 else NA
+    sensitivity_models[[study]] <- list(
+      model = mod_excl,
+      I2 = I2_excl,
+      intercept = coef(mod_excl)[1],
+      intercept_p = intercept_p_excl,
+      intercept_signif = intercept_signif_excl
+    )
+  }
+  if (length(sensitivity_models) == 0) {
+    all_results[[miR]] <- list(
+      full_model = full_model,
+      loo_results = loo_results,
+      sensitivity_models = list(),
+      sensitivity_summary = NULL
+    )
+    next
+  }
+  
+  sensitivity_signif_list <- list()
+  for (study in names(sensitivity_models)) {
+    data_excl <- filter(data_clean, Study_ID != study)
+    mod <- sensitivity_models[[study]]$model
+    coefs <- clubSandwich::coef_test(mod, cluster = data_excl$Study_ID, vcov = "CR2") %>%
+      as_tibble(rownames = "Term")
+    signif_vec <- coefs %>%
+      mutate(significant = p_Satt < 0.05) %>%
+      select(Term, significant) %>%
+      deframe()
+    sensitivity_signif_list[[study]] <- signif_vec
+  }
+  
+  studies <- names(sensitivity_models)
+  n <- length(studies)
+  i2_values <- sapply(sensitivity_models, function(x) {
+    val <- x$I2
+    if (is.null(val) || !is.finite(val)) NA else val
+  })
+  
+  summary_df <- data.frame(
+    Study = studies,
+    I2_Full = rep(full_I2, n),
+    I2_Excl = i2_values,
+    Change_I2 = i2_values - full_I2,
+    stringsAsFactors = FALSE
+  )
+  
+  timepoint_terms <- names(full_signif)
+  get_sig_change <- function(study, term) {
+    loo_sig <- sensitivity_signif_list[[study]][term]
+    full_sig <- full_signif[term]
+    if (is.na(loo_sig)) return(NA)
+    if (loo_sig != full_sig) return("Yes") else return("No")
+  }
+  
+  for (tp in timepoint_terms) {
+    summary_df[[paste0("SigChange_", tp)]] <- sapply(studies, get_sig_change, term = tp)
+  }
+  
+  threshold_I2_change <- 5
+  summary_df <- summary_df %>%
+    mutate(
+      Any_SigChange = apply(select(., starts_with("SigChange_")) == "Yes", 1, any, na.rm = TRUE),
+      Meaningful_Change = ifelse(
+        abs(Change_I2) > threshold_I2_change | Any_SigChange,
+        "Yes", "No"
+      )
+    ) %>%
+    mutate(across(where(is.numeric), round, 3))
+  all_results[[miR]] <- list(
+    full_model = full_model,
+    loo_results = loo_results,
+    sensitivity_models = sensitivity_models,
+    sensitivity_summary = summary_df
+  )
+
+}
+```
+
+
+# Exercise Modality
+```{r}
+# Initialize list to store summaries
+combined_summary <- list()
+
+# Get unique miRNAs
+miRs <- unique(miR_data$miRNA)
+
+# Loop over each miRNA
+for (miR in miRs) {
+  cat("\n--- Processing:", miR, "---\n")
+
+  tryCatch({
+
+    # Filter data for current miRNA, exclude rows missing Exercise_Modality
+    miR_df <- miR_data %>%
+      filter(miRNA == miR & !is.na(Exercise_Modality))
+
+    # Skip if no data
+    if (nrow(miR_df) == 0) {
+      cat("No valid data for", miR, "- skipping.\n")
+      next
+    }
+
+    # Create summary grouped by Exercise_Modality
+    modality_summary <- miR_df %>%
+      group_by(Exercise_Modality) %>%
+      summarise(
+        N_Observations = n(),
+        N_Studies = n_distinct(Study_ID),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(N_Studies)) %>%
+      mutate(miRNA = miR)  # Add miRNA column for identification
+
+    # Store summary for current miRNA in list
+    combined_summary[[miR]] <- modality_summary
+
+  }, error = function(e) {
+    cat("Error processing", miR, ":", e$message, "\n")
+  })
+}
+
+# Combine all summaries into one data frame
+combined_summary_df <- bind_rows(combined_summary)
+
+# Save combined summary to CSV
+write_csv(combined_summary_df, "csv/modality_summary.csv")
+
+```
+
+```{r}
+sessionInfo()
+```
+
