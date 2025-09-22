@@ -1,0 +1,265 @@
+---
+title: "Meta-analysis-Moderator: miR1"
+author: "Danielle Hiam"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    code_folding: "hide"
+  html_notebook:
+    theme: lumen
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r libraries}
+library(tidyverse)
+library(metafor)
+library(metaforest)
+library(caret)
+library(kableExtra)
+library(tidyr)
+library(knitr)
+library(pdp)
+library(stringr)
+library(tidytext)
+library(writexl)
+library(tidyr)
+library(readr)
+library(brms)
+```
+
+# **Setwd and import data**
+```{r setup}
+setwd("SET PATH")
+miR_data <- readRDS("rds/miR_data_clean_imputed.rds")
+```
+
+# Loop for running MetaForest
+```{r MetaForest}
+miR_data <- readRDS("rds/miR_data_clean_imputed.rds")
+dir.create("figures/MetaForest_R2", recursive = TRUE, showWarnings = FALSE)
+dir.create("csv/metaforest", recursive = TRUE, showWarnings = FALSE)
+metaforest_dir <- "intermediate/metaforest_data"
+dir.create(metaforest_dir, recursive = TRUE, showWarnings = FALSE)
+
+miRs <- unique(miR_data$miRNA)
+all_results <- list()
+all_varimp_long <- list()  
+oob_r2_list <- list()
+error_log <- list()
+
+# ==============================================
+# Main Loop: MetaForest per miR
+# ==============================================
+
+for (miR in miRs) {
+   tryCatch({
+      miR1 <- miR_data %>%
+      filter(miRNA == miR) %>%
+      mutate(
+        cohort.in.study = paste0(Study_ID, ".", Exercise_Modality),
+        across(c(Exercise_Modality, Training_Status, Haemolysis_QC, Extraction_QC,
+                 RT_QC, PCR_QC), as.factor),
+        Timepoints = factor(Timepoints, levels = c("PRE", "0HP", "1HP","1.5HP", "2HP", 
+                                                   "4HP", "5HP", "21HP", "24HP","48HP", 
+                                                   "3HP", "12HP", "6HP")),
+        vi = (logFC_SD^2) / Total_N
+      ) %>%
+      filter(!is.na(logFC_SD)) %>%
+      mutate(TimeWindow = case_when(
+        Timepoints == "PRE" ~ "Baseline",
+        Timepoints == "0HP" ~ "Post",
+        Timepoints %in% c("1HP", "1.5HP", "2HP") ~ "1-2HP",
+        Timepoints %in% c("3HP", "4HP", "5HP", "6HP") ~ "3-6HP",
+        Timepoints == "12HP" ~ "12HP",
+        Timepoints %in% c("21HP", "24HP") ~ "24HP",
+        Timepoints == "48HP" ~ "48HP",
+        TRUE ~ NA_character_
+      )) %>%
+      mutate(TimeWindow = factor(TimeWindow, levels = c("Baseline", "Post", "1-2HP", 
+                                                        "3-6HP", "12HP", "24HP", "48HP")))
+        miR1$cohort.in.study <- as.factor(miR1$cohort.in.study)
+
+    window_counts <- miR1 %>%
+      group_by(TimeWindow) %>%
+      summarise(n_study = n_distinct(Study_ID), .groups = "drop") %>%
+      filter(n_study >= 5)
+    
+    if (nrow(window_counts) == 0) {
+      cat("Skipping", miR, ": No time window has ≥5 studies\n")
+      next
+    }
+
+    valid_windows <- window_counts$TimeWindow
+    miR1_sub <- miR1 %>%
+      filter(TimeWindow %in% valid_windows) %>%
+      select(-c(Study_ID, Year, miRNA,  Group, FC, FC_SEM, FC_SD, 
+                logFC_SD, Modality_Type, Exercise_Broad)) %>%
+      rename(yi = logFC)
+    
+    if (nrow(miR1_sub) == 0 || !"yi" %in% names(miR1_sub)) {
+      cat("Skipping", miR, "- 'logFC' missing or no data after filtering\n")
+      next
+    }
+
+    mod_cols <- setdiff(names(miR1_sub), c("yi", "vi", "cohort.in.study", "Timepoints", "TimeWindow"))
+
+    if (length(mod_cols) > 0) {
+      nzv <- nearZeroVar(miR1_sub[, mod_cols], saveMetrics = TRUE)
+      nzv_mods <- rownames(nzv[nzv$nzv,])
+      if (length(nzv_mods) > 0) {
+        miR1_sub <- miR1_sub %>% select(-all_of(nzv_mods))
+      }
+    }
+    
+    mod_cols <- setdiff(names(miR1_sub), c("yi", "vi", "cohort.in.study", "TimeWindow", "Timepoints"))
+        if (length(mod_cols) == 0) {
+      cat("Skipping", miR, "- no moderators retained after NZV removal\n")
+      error_log[[miR]] <- "No moderators retained"
+      next
+    }
+    
+    set.seed(42)
+    n_boot <- 100
+    varimp_mat <- matrix(NA, nrow = n_boot, ncol = length(mod_cols))
+    colnames(varimp_mat) <- mod_cols
+    
+    for (b in seq_len(n_boot)) {
+      boot_idx <- sample(seq_len(nrow(miR1_sub)), replace = TRUE)
+      mf_boot <- MetaForest(
+        yi ~ ., data = miR1_sub[boot_idx, c("yi", "vi", "cohort.in.study", mod_cols)],
+        study = "cohort.in.study",
+        whichweights = "random",
+        num.trees = 5000
+      )
+      varimp_mat[b, ] <- mf_boot$forest$variable.importance[mod_cols]
+    }
+    
+prop_pos <- colMeans(varimp_mat > 0)
+selected_mods <- names(prop_pos)[prop_pos >= 0.5]
+
+if (length(selected_mods) == 0) {
+  cat("Skipping", miR, "- no moderators passed importance threshold\n")
+  error_log[[miR]] <- "No moderators passed importance threshold"
+  next
+}
+
+median_imp <- apply(varimp_mat[, selected_mods, drop = FALSE], 2, median, na.rm = TRUE)
+mean_imp <- colMeans(varimp_mat[, selected_mods, drop = FALSE], na.rm = TRUE)
+
+   mf_full <- MetaForest(
+      yi ~ ., data = miR1_sub[, c("yi", "vi", "cohort.in.study", mod_cols)],
+      study = "cohort.in.study",
+      whichweights = "random",
+      num.trees = 10000
+    )
+
+    set.seed(1)
+    mf_replications <- replicate(100, {
+      mf_tmp <- MetaForest(
+        yi ~ ., 
+        num.trees = 5000,
+        data = miR1_sub[, c("yi", "vi", "cohort.in.study", mod_cols)]
+      )
+      mf_tmp$forest$r.squared
+    })
+    
+    rsq_vals <- data.frame(r.squared = mf_replications)
+
+    p_r2 <- ggplot(rsq_vals, aes(r.squared)) +
+      geom_density(fill = "steelblue", alpha = 0.6) +
+      labs(
+        title = bquote("MetaForest "~ R^2 ~ "Distribution for" ~ .(miR)),
+        x = expression(R^2),
+        y = "Density"
+      ) +
+      theme_classic()
+    
+    ggsave(
+      filename = paste0("figures/MetaForest_R2/", miR, "_R2_density.png"),
+      plot = p_r2, width = 6, height = 4
+    )
+
+    oob_r2 <- median(rsq_vals$r.squared, na.rm = TRUE)
+    oob_r2_list[[miR]] <- oob_r2
+    
+    saveRDS(list(
+      miR = miR,
+      selected_mods = selected_mods,
+      varimp_bootstrap = varimp_mat,
+      filtered_data = miR1_sub,
+      oob_r2 = oob_r2
+    ), file = file.path(metaforest_dir, paste0(miR, "_metaforest.rds")))
+    
+    varimp_long <- as.data.frame(varimp_mat) %>%
+      mutate(Bootstrap = 1:n()) %>%
+      pivot_longer(
+        cols = -Bootstrap,
+        names_to = "Moderator",
+        values_to = "Importance"
+      ) %>%
+      mutate(miRNA = miR)
+    
+    all_varimp_long[[miR]] <- varimp_long
+    
+  }, error = function(e) {
+    cat("Error [MetaForest] for", miR, ":", e$message, "\n")
+    error_log[[paste0(miR, "_metaforest")]] <- e$message
+  })
+}
+
+varimp_all_df <- bind_rows(all_varimp_long)
+varimp_all_df <- varimp_all_df %>%
+  mutate(OOB_R2 = oob_r2_list[miRNA] %>% unlist())
+write.csv(varimp_all_df, file = "csv/metaforest/ALL_miRs_varimp_bootstrap_OOB.csv", row.names = FALSE)
+varimp_summary <- varimp_all_df %>%
+  group_by(miRNA, Moderator) %>%
+  summarise(
+    mean_importance   = mean(Importance, na.rm = TRUE),
+    sd_importance     = sd(Importance, na.rm = TRUE),
+    median_importance = median(Importance, na.rm = TRUE),
+    prop_positive     = mean(Importance > 0, na.rm = TRUE),
+    OOB_R2            = unique(OOB_R2),
+    .groups = "drop"
+  )%>%
+  mutate(important = prop_positive >= 0.5)
+write.csv(varimp_summary, file = "csv/metaforest/ALL_miRs_varimp_summary.csv", row.names = FALSE)
+
+# Overall summary across all miRNAs
+summary_imp <- varimp_summary %>%
+  group_by(Moderator) %>%
+  summarise(
+    mean_importance = mean(mean_importance),
+    sd_importance = sd(mean_importance),
+    n = n(),
+    important = mean(prop_positive >= 0.5) > 0.5,
+    .groups = "drop"
+  )
+all_imp_long <- varimp_all_df %>%
+  rename(
+    miR = miRNA,
+    variable = Moderator,
+    importance = Importance
+  )
+
+imp_matrix <- all_imp_long %>%
+  group_by(miR, variable) %>%
+  summarise(median_importance = median(importance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = variable, values_from = median_importance)
+
+write.csv(varimp_summary, "csv/metaforest/variable_importance_summary_per_miR.csv", row.names = FALSE)
+write.csv(summary_imp, "csv/metaforest/variable_importance_summary_overall.csv", row.names = FALSE)
+write.csv(all_imp_long, "csv/metaforest/variable_importance_all_long.csv", row.names = FALSE)
+
+
+```
+
+sessionInfo()
+
