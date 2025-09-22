@@ -1,12 +1,12 @@
-# circulating-miRNAs-and-exercise-
+# Response of cell-free miRNAs to acute exercise: A systematic Review and Meta-Analysis
 
-Three Files available:
-1) Data Imputation_Github: Imputation of baseline SD if not available
-2) Meta Analysis_Loop_GitHub: Meta-analysis of each miRNA (include meta, heterogeneity checks, publication bias and diagnostics, Leave-one-out sensitivity analysis
-3) Meta Analysis_Moderator_GitHub: Exploratory/Meta-regression of moderators
+Code Files:
+#### 1) Data Imputation_Github: Imputation of baseline SD if not available
+#### 2) Meta Analysis_Loop_GitHub: Meta-analysis of each miRNA (include meta, heterogeneity checks, publication bias and diagnostics, Leave-one-out sensitivity analysis
+#### 3) Meta Analysis_Moderator_GitHub: Exploratory/Meta-regression of moderators
 
 
-Code Methods:
+## Detailed Methodology:
 For each study, we computed the mean and standard deviation (SD) of the log fold-change (logFC) in miRNA expression, calculated via the delta-Ct method and expressed in arbitrary units, between the baseline and the relevant post-exercise timepoints. To retain as much data as possible, time points were sorted into windows based on the following timepoints post-acute exercise: 0HP, 1–2HP, 2–6HP, 6–24HP, > 24HP. Missing SD at baseline were imputed using k-nearest neighbours method implemented in the VIM package. We restricted analyses to miRNAs assessed in at least five studies per time window to minimise false-positive findings. Timepoints were not evenly spaced and therefore we undertook sensitivity analysis to determine best-fitting correlation structure using a decay function that reduces correlation with increasing time lag. The variance-covariance matrix used in the meta-analysis was constructed using the best-fitting correlation parameters (ρ=0.6, decay rate=0.2). This matrix encodes the within-cohort covariance structure accounting for the decaying correlation between effect sizes measured at different timepoints. We then compared four different random-effects structures to identify the best model for capturing study- and cohort-level variability in miRNA responses to exercise using the metafor package.
 1.	Random Intercept Only: random = ~ 1 | Study_ID. 
 2.	Nested cohort model: random = ~ 1 | Study_ID/cohort_id. 
